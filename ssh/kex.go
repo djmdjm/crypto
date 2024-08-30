@@ -15,20 +15,23 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"os" // XXX
 
+	"filippo.io/mlkem768"
 	"golang.org/x/crypto/curve25519"
 )
 
 const (
-	kexAlgoDH1SHA1                = "diffie-hellman-group1-sha1"
-	kexAlgoDH14SHA1               = "diffie-hellman-group14-sha1"
-	kexAlgoDH14SHA256             = "diffie-hellman-group14-sha256"
-	kexAlgoDH16SHA512             = "diffie-hellman-group16-sha512"
-	kexAlgoECDH256                = "ecdh-sha2-nistp256"
-	kexAlgoECDH384                = "ecdh-sha2-nistp384"
-	kexAlgoECDH521                = "ecdh-sha2-nistp521"
-	kexAlgoCurve25519SHA256LibSSH = "curve25519-sha256@libssh.org"
-	kexAlgoCurve25519SHA256       = "curve25519-sha256"
+	kexAlgoDH1SHA1                   = "diffie-hellman-group1-sha1"
+	kexAlgoDH14SHA1                  = "diffie-hellman-group14-sha1"
+	kexAlgoDH14SHA256                = "diffie-hellman-group14-sha256"
+	kexAlgoDH16SHA512                = "diffie-hellman-group16-sha512"
+	kexAlgoECDH256                   = "ecdh-sha2-nistp256"
+	kexAlgoECDH384                   = "ecdh-sha2-nistp384"
+	kexAlgoECDH521                   = "ecdh-sha2-nistp521"
+	kexAlgoCurve25519SHA256LibSSH    = "curve25519-sha256@libssh.org"
+	kexAlgoCurve25519SHA256          = "curve25519-sha256"
+	kexAlgoMLKEM768xCurve25519SHA256 = "mlkem768x25519-sha256"
 
 	// For the following kex only the client half contains a production
 	// ready implementation. The server half only consists of a minimal
@@ -447,6 +450,7 @@ func init() {
 	kexAlgoMap[kexAlgoECDH256] = &ecdh{elliptic.P256()}
 	kexAlgoMap[kexAlgoCurve25519SHA256] = &curve25519sha256{}
 	kexAlgoMap[kexAlgoCurve25519SHA256LibSSH] = &curve25519sha256{}
+	kexAlgoMap[kexAlgoMLKEM768xCurve25519SHA256] = &mlkem768WithCurve25519sha256{}
 	kexAlgoMap[kexAlgoDHGEXSHA1] = &dhGEXSHA{hashFunc: crypto.SHA1}
 	kexAlgoMap[kexAlgoDHGEXSHA256] = &dhGEXSHA{hashFunc: crypto.SHA256}
 }
@@ -570,6 +574,162 @@ func (kex *curve25519sha256) Server(c packetConn, rand io.Reader, magics *handsh
 
 	reply := kexECDHReplyMsg{
 		EphemeralPubKey: kp.pub[:],
+		HostKey:         hostKeyBytes,
+		Signature:       sig,
+	}
+	if err := c.writePacket(Marshal(&reply)); err != nil {
+		return nil, err
+	}
+	return &kexResult{
+		H:         H,
+		K:         K,
+		HostKey:   hostKeyBytes,
+		Signature: sig,
+		Hash:      crypto.SHA256,
+	}, nil
+}
+
+// mlkem768WithCurve25519sha256 implements the hybrid ML-KEM768 with
+// curve25519-sha256 key exchange method, as described by
+// draft-kampanakis-curdle-ssh-pq-ke-04.
+type mlkem768WithCurve25519sha256 struct{}
+
+func (kex *mlkem768WithCurve25519sha256) Client(c packetConn, rand io.Reader, magics *handshakeMagics) (*kexResult, error) {
+	var c25519kp curve25519KeyPair
+	var mlkemDk *mlkem768.DecapsulationKey
+	var err error
+
+	if err = c25519kp.generate(rand); err != nil {
+		return nil, err
+	}
+	if mlkemDk, err = mlkem768.GenerateKey(); err != nil {
+		return nil, err
+	}
+
+	// The server public value is the concatenation of the KEM encapsulation
+	// key and the Curve25519 ECDH public value.
+	hybridKey := append(mlkemDk.EncapsulationKey()[:], c25519kp.pub[:]...)
+	if err := c.writePacket(Marshal(&kexECDHInitMsg{hybridKey[:]})); err != nil {
+		return nil, err
+	}
+
+	packet, err := c.readPacket()
+	if err != nil {
+		return nil, err
+	}
+
+	var reply kexECDHReplyMsg
+	if err = Unmarshal(packet, &reply); err != nil {
+		return nil, err
+	}
+	if len(reply.EphemeralPubKey) != mlkem768.CiphertextSize+32 {
+		return nil, errors.New("ssh: peer's ML-KEM768/curve25519 public value has wrong length")
+	}
+
+	// Perform KEM decapsulate operation to obtain shared key from ML-KEM.
+	var mlkem768Secret []byte
+	if mlkem768Secret, err = mlkem768.Decapsulate(mlkemDk, reply.EphemeralPubKey[:mlkem768.CiphertextSize]); err != nil {
+		return nil, err
+	}
+
+	// Complete Curve25519 ECDH to obtain its shared key.
+	var c25519ServPub, c25519Secret [32]byte
+	copy(c25519ServPub[:], reply.EphemeralPubKey[mlkem768.CiphertextSize:])
+	curve25519.ScalarMult(&c25519Secret, &c25519kp.priv, &c25519ServPub)
+	if subtle.ConstantTimeCompare(c25519Secret[:], curve25519Zeros[:]) == 1 {
+		return nil, errors.New("ssh: peer's ML-KEM768/curve25519 public value has wrong order")
+	}
+
+	// Compute actual shared key.
+	h := crypto.SHA256.New()
+	h.Write(mlkem768Secret)
+	h.Write(c25519Secret[:])
+	secret := h.Sum(nil)
+
+	h = crypto.SHA256.New()
+	magics.write(h)
+	writeString(h, reply.HostKey)
+	writeString(h, hybridKey[:])
+	writeString(h, reply.EphemeralPubKey)
+
+	K := make([]byte, stringLength(len(secret)))
+	marshalString(K, secret)
+	h.Write(K)
+
+	return &kexResult{
+		H:         h.Sum(nil),
+		K:         K,
+		HostKey:   reply.HostKey,
+		Signature: reply.Signature,
+		Hash:      crypto.SHA256,
+	}, nil
+}
+
+func (kex *mlkem768WithCurve25519sha256) Server(c packetConn, rand io.Reader, magics *handshakeMagics, priv AlgorithmSigner, algo string) (result *kexResult, err error) {
+	packet, err := c.readPacket()
+	if err != nil {
+		return
+	}
+	var kexInit kexECDHInitMsg
+	if err = Unmarshal(packet, &kexInit); err != nil {
+		return
+	}
+
+	if len(kexInit.ClientPubKey) != mlkem768.EncapsulationKeySize+32 {
+		return nil, errors.New("ssh: peer's ML-KEM768/curve25519 public value has wrong length")
+	}
+
+	// Perform KEM encapsulate operation to obtain ciphertext and
+	// shared key.
+	var mlkem768Ciphertext, mlkem768Secret []byte
+	if mlkem768Ciphertext, mlkem768Secret, err = mlkem768.Encapsulate(kexInit.ClientPubKey[:mlkem768.EncapsulationKeySize]); err != nil {
+		return nil, err
+	}
+
+	// Perform server size of Curve25519 ECDH to obtain server public value
+	// and shared key.
+	var c25519kp curve25519KeyPair
+	if err := c25519kp.generate(rand); err != nil {
+		return nil, err
+	}
+	var c25519ClientPub, c25519Secret [32]byte
+	copy(c25519ClientPub[:], kexInit.ClientPubKey[mlkem768.EncapsulationKeySize:])
+	curve25519.ScalarMult(&c25519Secret, &c25519kp.priv, &c25519ClientPub)
+	if subtle.ConstantTimeCompare(c25519Secret[:], curve25519Zeros[:]) == 1 {
+		return nil, errors.New("ssh: peer's curve25519 public value has wrong order")
+	}
+
+	// The server public value is the concatenation of the KEM encapsulation
+	// key and the Curve25519 ECDH public value.
+	hybridKey := append(mlkem768Ciphertext[:], c25519kp.pub[:]...)
+
+	// Compute actual shared key.
+	h := crypto.SHA256.New()
+	h.Write(mlkem768Secret)
+	h.Write(c25519Secret[:])
+	secret := h.Sum(nil)
+
+	hostKeyBytes := priv.PublicKey().Marshal()
+
+	h = crypto.SHA256.New()
+	magics.write(h)
+	writeString(h, hostKeyBytes)
+	writeString(h, kexInit.ClientPubKey)
+	writeString(h, hybridKey)
+
+	K := make([]byte, stringLength(len(secret)))
+	marshalString(K, secret)
+	h.Write(K)
+
+	H := h.Sum(nil)
+
+	sig, err := signAndMarshal(priv, rand, H, algo)
+	if err != nil {
+		return nil, err
+	}
+
+	reply := kexECDHReplyMsg{
+		EphemeralPubKey: hybridKey[:],
 		HostKey:         hostKeyBytes,
 		Signature:       sig,
 	}
